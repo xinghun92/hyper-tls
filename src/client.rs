@@ -1,6 +1,8 @@
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::net::SocketAddr;
+use std::error;
 
 use futures::{Future, Poll};
 use hyper::client::{Connect, HttpConnector};
@@ -8,6 +10,7 @@ use hyper::Uri;
 use native_tls::TlsConnector;
 pub use native_tls::Error;
 use tokio_core::reactor::Handle;
+use tokio_core::net::TcpStream;
 use tokio_service::Service;
 use tokio_tls::TlsConnectorExt;
 
@@ -68,13 +71,56 @@ impl<T> fmt::Debug for HttpsConnector<T> {
     }
 }
 
+impl Service for HttpsConnector<HttpConnector> {
+    fn call(&self, uri: Uri) -> Self::Future {
+        let is_https = uri.scheme() == Some("https");
+        let host = match uri.host() {
+            Some(host) => host.to_owned(),
+            None => return HttpsConnecting(
+                Box::new(
+                    ::futures::future::err(
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid url, missing host"
+                        )
+                    )
+                )
+            ),
+        };
+        let connecting = self.http.connect(uri);
+        let tls = self.tls.clone();
+        let verification = self.hostname_verification;
+
+        let fut: BoxedFut<TcpStream> = if is_https {
+            let fut = connecting.and_then(move |tcp| {
+                let peer_addr = tcp.peer_addr();
+                let handshake = if verification {
+                    tls.connect_async(&host, tcp)
+                } else {
+                    tls.danger_connect_async_without_providing_domain_for_certificate_verification_and_server_name_indication(tcp)
+                };
+                handshake
+                    .map(|conn| MaybeHttpsStream::Https(conn))
+                    .map_err(|e| {
+                        let e = TcpError{ peer_addr, other: e };
+                        io::Error::new(io::ErrorKind::Other, e)
+                    })
+            });
+            Box::new(fut)
+        } else {
+            Box::new(connecting.map(|tcp| MaybeHttpsStream::Http(tcp)))
+        };
+        HttpsConnecting(fut)
+    }
+}
+
 impl<T: Connect> Service for HttpsConnector<T> {
     type Request = Uri;
     type Response = MaybeHttpsStream<T::Output>;
     type Error = io::Error;
     type Future = HttpsConnecting<T::Output>;
 
-    fn call(&self, uri: Uri) -> Self::Future {
+    default fn call(&self, uri: Uri) -> Self::Future {
         let is_https = uri.scheme() == Some("https");
         let host = match uri.host() {
             Some(host) => host.to_owned(),
@@ -111,6 +157,25 @@ impl<T: Connect> Service for HttpsConnector<T> {
         HttpsConnecting(fut)
     }
 
+}
+
+#[derive(Debug)]
+struct TcpError {
+    peer_addr: io::Result<SocketAddr>,
+    other: Error
+}
+
+impl fmt::Display for TcpError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TcpError {{ peer_addr= {:?} e= {:?} }}",
+               self.peer_addr, self.other)
+    }
+}
+
+impl error::Error for TcpError {
+    fn description(&self) -> &str {
+        "tcp error"
+    }
 }
 
 type BoxedFut<T> = Box<Future<Item=MaybeHttpsStream<T>, Error=io::Error>>;
